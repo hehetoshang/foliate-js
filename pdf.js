@@ -1,4 +1,4 @@
-const pdfjsPath = path => `/vendor/pdfjs/${path}`
+import { pdfjsPath } from './pdf-assets.js'
 
 import '@pdfjs/pdf.min.mjs'
 const pdfjsLib = globalThis.pdfjsLib
