@@ -6,6 +6,27 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsPath('pdf.worker.min.mjs')
 
 const fetchText = async url => await (await fetch(url)).text()
 
+// The OS accessibility "font size" setting scales every piece of WebView-rendered
+// text (including this transparent selection/highlight text layer) but leaves the
+// page's canvas bitmap untouched. Only the glyph *size* (a font-size) is scaled;
+// the text layer's positions are percentages of the `--total-scale-factor`-sized
+// container and are not. Left uncorrected the glyphs render `fontScale`x larger
+// than the ones baked into the canvas, so selection and highlight rectangles
+// overshoot the text into the blank margins and sit too low (readest #4480).
+// Measure the scale here so render() can divide it back out of the glyph-size
+// lever only. offsetHeight of a 100px/line-height-1 box reflects the OS font
+// scaling but not devicePixelRatio or CSS transforms, so it isolates it.
+const getFontScale = doc => {
+    const probe = doc.createElement('div')
+    probe.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;'
+        + 'font-size:100px;line-height:1;text-size-adjust:none;-webkit-text-size-adjust:none'
+    probe.textContent = 'x'
+    doc.body.append(probe)
+    const fontScale = probe.offsetHeight / 100
+    probe.remove()
+    return fontScale > 0 ? fontScale : 1
+}
+
 let textLayerBuilderCSS = null
 let annotationLayerBuilderCSS = null
 
@@ -130,6 +151,45 @@ const setupPanningEvents = (doc) => {
     container.style.cursor = 'grab'
 }
 
+// iOS kills the WKWebView content process when it exceeds a per-process memory
+// high-water limit (~2 GB). A device crash log for readest #5118 shows the
+// foreground WebContent process reaching 2.1 GB while paging a PDF, right before
+// the reader "closed". Both a page's canvas bitmap and its WebKit backing layer
+// are allocated at the render scale, so their memory grows with the SQUARE of the
+// device pixel ratio. Phones report dpr 3, which is the tipping factor.
+// Rendering at 2x instead of 3x is still retina-sharp but uses ~2.25x less memory
+// per page (the crisp, selectable text layer is a separate DOM layer, unaffected).
+const MAX_RENDER_DPR = 2
+// Hard ceiling on a single page's bitmap area (~3.1 Mpx ≈ 12.6 MB) so a large
+// tablet page can't blow the budget even after the dpr clamp.
+const MAX_CANVAS_PIXELS = 2048 * 1536
+
+// Only mobile WebViews get that budget. Desktop browsers have no per-process
+// memory ceiling, and a page fitted to a desktop window is several times the
+// budget on its own, so clamping there bought nothing and cost sharpness: the
+// raster ended up coarser than the screen, the browser upscaled it into the CSS
+// box, and PDF text looked blurry (readest #5251). iPadOS reports a desktop
+// ("Macintosh") user agent, so touch points are what give a tablet away.
+const isMobileWebView = () => {
+    const ua = navigator.userAgent
+    return /Android|iPhone|iPad|iPod/i.test(ua)
+        || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1)
+}
+
+// The device pixel ratio to rasterise this page at: the real dpr on desktop, or
+// on mobile the dpr clamped by both MAX_RENDER_DPR and the per-canvas pixel
+// budget. Never below 1 (CSS resolution).
+const getRenderDpr = (page, zoom) => {
+    let dpr = devicePixelRatio || 1
+    if (isMobileWebView()) {
+        dpr = Math.min(dpr, MAX_RENDER_DPR)
+        const { width, height } = page.getViewport({ scale: zoom || 1 })
+        const area = width * height * dpr * dpr
+        if (area > MAX_CANVAS_PIXELS) dpr *= Math.sqrt(MAX_CANVAS_PIXELS / area)
+    }
+    return Math.max(1, dpr)
+}
+
 const render = async (page, doc, zoom, pageColors) => {
     if (!doc) return
 
@@ -144,32 +204,40 @@ const render = async (page, doc, zoom, pageColors) => {
         activeRenderTasks.delete(doc)
     }
 
-    const scale = zoom * devicePixelRatio
-    doc.documentElement.style.transform = `scale(${1 / devicePixelRatio})`
-    doc.documentElement.style.transformOrigin = 'top left'
-    doc.documentElement.style.setProperty('--total-scale-factor', scale)
+    // Rasterise the page bitmap over-sampled (clamped for the iOS content-process
+    // memory budget, see getRenderDpr / readest #5118) but lay the whole DOM out
+    // at the true display size. The <canvas> element natively downscales its
+    // bitmap to its CSS box, so the raster stays crisp WITHOUT scaling the
+    // document. Scaling the document with `transform` promotes the whole page to
+    // one over-sized GPU IOSurface that OOM-kills the iOS WebContent process on
+    // zoom; scaling it with `zoom` throws off getBoundingClientRect, misplacing
+    // text selection and the annotation toolbar. Neither is used: the text and
+    // annotation layers live in real display coordinates.
+    const renderDpr = getRenderDpr(page, zoom)
+    const renderScale = zoom * renderDpr
+    doc.documentElement.style.setProperty('--total-scale-factor', zoom)
     doc.documentElement.style.setProperty('--user-unit', '1')
     doc.documentElement.style.setProperty('--scale-round-x', '1px')
     doc.documentElement.style.setProperty('--scale-round-y', '1px')
-    const viewport = page.getViewport({ scale })
+    // The bitmap viewport is over-sampled; the display viewport drives the CSS
+    // box, the text layer and the annotation layer (all in display coordinates).
+    const renderViewport = page.getViewport({ scale: renderScale })
+    const displayViewport = page.getViewport({ scale: zoom })
 
     // the canvas must be in the `PDFDocument`'s `ownerDocument`
     // (`globalThis.document` by default); that's where the fonts are loaded
     const canvas = document.createElement('canvas')
-    canvas.height = viewport.height
-    canvas.width = viewport.width
-    // `canvas.width`/`canvas.height` are the bitmap size and must be integers,
-    // so the fractional `viewport.{width,height}` (= pageSizeCss *
-    // devicePixelRatio) is truncated. The iframe content is displayed scaled by
-    // `1 / devicePixelRatio` (see the `documentElement` transform above), so a
-    // truncated bitmap renders up to ~1 device pixel narrower than the page box,
-    // leaving a one-pixel white seam at the spine of a two-page spread (#4587).
-    // Pin an explicit CSS size to the un-truncated viewport dimensions so the
-    // bitmap scales to fill the page box exactly.
-    canvas.style.width = `${viewport.width}px`
-    canvas.style.height = `${viewport.height}px`
+    canvas.height = renderViewport.height
+    canvas.width = renderViewport.width
+    // The CSS box is the un-truncated display size, so the (integer-truncated)
+    // over-sampled bitmap is scaled by the browser to fill the page box exactly.
+    // Pinning the box to the display viewport (rather than letting the truncated
+    // bitmap drive layout) also keeps the left page flush to the spine of a
+    // two-page spread instead of exposing a one-pixel white seam (#4587).
+    canvas.style.width = `${displayViewport.width}px`
+    canvas.style.height = `${displayViewport.height}px`
     const canvasContext = canvas.getContext('2d')
-    const renderTask = page.render({ canvasContext, viewport, pageColors })
+    const renderTask = page.render({ canvasContext, viewport: renderViewport, pageColors })
     activeRenderTasks.set(doc, renderTask)
 
     try {
@@ -212,12 +280,20 @@ const render = async (page, doc, zoom, pageColors) => {
     container.replaceChildren()
     const textLayer = new pdfjsLib.TextLayer({
         textContentSource: await page.streamTextContent(),
-        container, viewport,
+        container, viewport: displayViewport,
     })
     await textLayer.render()
 
     // Bail out if superseded after async text layer render
     if (renderGenerations.get(doc) !== generation) return
+
+    // Counteract the OS font-size accessibility scaling on the text layer's glyph
+    // size only (see getFontScale). `--text-scale-factor` feeds `font-size` and
+    // nothing else, so dividing it leaves positions (which scale with
+    // `--total-scale-factor`) aligned with the canvas at any font-size setting.
+    const fontScale = getFontScale(doc)
+    if (fontScale !== 1) container.style.setProperty('--text-scale-factor',
+        `calc(var(--total-scale-factor) * var(--min-font-size) / ${fontScale})`)
 
     // hide "offscreen" canvases appended to document when rendering text layer
     // https://github.com/mozilla/pdf.js/blob/642b9a5ae67ef642b9a8808fd9efd447e8c350e2/web/pdf_viewer.css#L51-L58
@@ -246,9 +322,13 @@ const render = async (page, doc, zoom, pageColors) => {
     const linkService = {
         goToDestination: () => {},
         getDestinationHash: dest => JSON.stringify(dest),
+        // pdf.js AnnotationLayer calls getAnchorUrl for named-action / GoTo link
+        // annotations; without it the render rejects with "getAnchorUrl is not a
+        // function" (READEST-2M). Match pdf.js SimpleLinkService, which returns ''.
+        getAnchorUrl: () => '',
         addLinkAttributes: (link, url) => link.href = url,
     }
-    await new pdfjsLib.AnnotationLayer({ page, viewport, div, linkService }).render({
+    await new pdfjsLib.AnnotationLayer({ page, viewport: displayViewport, div, linkService }).render({
         annotations: await page.getAnnotations(),
     })
 }
