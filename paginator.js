@@ -1,5 +1,29 @@
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+// WebKit before Safari 17 (iOS <= 16) resolves the `document.fonts.ready`
+// promise synchronously while purging still-loading `@font-face`s during a
+// style resolver rebuild (CSSFontFaceSet::purge). Script execution is
+// disallowed in the middle of style resolution, so the resolution trips a
+// release assert and kills the WebContent process (DeferredPromise::callFunction
+// under CSSFontSelector::buildStarted in the .ips crash log).
+// The deferring guard only landed in WebKit 616 (Safari/iOS 17), the same
+// release that shipped URL.canParse. The JS promise is created lazily on
+// first access of `.ready`, so on affected engines never touch it and poll
+// `fonts.status` instead.
+export const fontsReady = doc => {
+    const fonts = doc?.fonts
+    const win = doc?.defaultView
+    if (!fonts || !win) return Promise.resolve()
+    const buggyWebKit = win.navigator?.userAgent?.includes('AppleWebKit/605')
+        && typeof win.URL?.canParse !== 'function'
+    if (!buggyWebKit) return fonts.ready
+    return new Promise(resolve => {
+        const poll = () => fonts.status === 'loaded'
+            ? resolve() : win.setTimeout(poll, 100)
+        poll()
+    })
+}
+
 const debounce = (f, wait, immediate) => {
     let timeout
     return (...args) => {
@@ -13,6 +37,11 @@ const debounce = (f, wait, immediate) => {
         if (callNow) f(...args)
     }
 }
+
+// How long a continuous run of scrolled-mode scroll events may last before a
+// relocate is forced mid-scroll, so reading progress keeps updating while the
+// scrolling never pauses (readest#5635).
+const SCROLL_RELOCATE_MAX_WAIT = 1000
 
 // Transforms ALL children of the container so multi-view layouts
 // animate as a unified whole. Extra elements (e.g. background) are
@@ -63,6 +92,24 @@ const cssAnimateScroll = (element, scrollProp, startValue, endValue, duration, e
 
         // Apply final scroll position
         element[scrollProp] = endValue
+        // Translating the children shrank the container's scrollable overflow
+        // by the animated distance, and WebKit (iOS 18) still reports that
+        // shrunken extent when the transforms are cleared in this same task —
+        // so the assignment above is clamped. Mid-book the clamp lands far
+        // beyond the target and is invisible; on the last page of the book,
+        // where the target *is* the maximum scroll offset, it lands a full page
+        // short and the page visibly snaps back (readest#5663).
+        if (Math.abs(element[scrollProp] - endValue) > 0.5) {
+            // Forcing a layout here is not enough — the extent it reports is
+            // restored, but the scroll clamp still uses the stale one for the
+            // rest of the task. The next frame is past the compositor's
+            // animation teardown, so re-apply there.
+            requestAnimationFrame(() => {
+                element[scrollProp] = endValue
+                resolve()
+            })
+            return
+        }
         resolve()
     }
 
@@ -754,7 +801,7 @@ class View {
                 // the resize observer above doesn't work in Firefox
                 // (see https://bugzilla.mozilla.org/show_bug.cgi?id=1832939)
                 // until the bug is fixed we can at least account for font load
-                this.fontReady = doc.fonts.ready.then(() => this.expand())
+                this.fontReady = fontsReady(doc).then(() => this.expand())
 
                 resolve()
             }, { once: true })
@@ -1251,6 +1298,7 @@ export class Paginator extends HTMLElement {
     #touchScrolled
     #lastVisibleRange
     #scrollLocked = false
+    #subpixelOffset = 0
     #isAnimating = false
     // Generation counter for slideTurnAnimation: a newer vertical page turn
     // bumps it so an in-flight two-phase slide stops touching the DOM.
@@ -1432,13 +1480,20 @@ export class Paginator extends HTMLElement {
         this.#footer = this.#root.getElementById('footer')
 
         this.#observer.observe(this.#container)
+        const scrolledScrollRelocate = () => {
+            // Skip entirely while stabilizing — preserve #justAnchored
+            // so the first post-stabilization fire still sees it.
+            if (this.#stabilizing) return
+            if (this.#justAnchored) this.#justAnchored = false
+            else this.#afterScroll('scroll')
+        }
+        // Start time of the current unbroken run of scroll events, for the
+        // periodic mid-scroll relocate below; null when no run is in progress.
+        let scrollBurstStart = null
         const debouncedScroll = debounce(() => {
+            scrollBurstStart = null
             if (this.scrolled && !this.#isAnimating) {
-                // Skip entirely while stabilizing — preserve #justAnchored
-                // so the first post-stabilization fire still sees it.
-                if (this.#stabilizing) return
-                if (this.#justAnchored) this.#justAnchored = false
-                else this.#afterScroll('scroll')
+                scrolledScrollRelocate()
                 // Backward preloading is handled eagerly in the (non-debounced)
                 // scroll listener below, mirroring the forward buffer.
             } else if (!this.scrolled) {
@@ -1505,6 +1560,23 @@ export class Paginator extends HTMLElement {
                                 })
                         }
                     }
+                }
+            }
+            // A scroll that never pauses — the Auto Scroll reading mode, a
+            // held scroll key — resets the trailing debounce forever, so the
+            // scrolled-mode relocate (and with it reading progress) would only
+            // fire once the scrolling stopped (readest#5635). Relocate at most
+            // once per SCROLL_RELOCATE_MAX_WAIT while the run of scroll events
+            // lasts; the debounced call still reports the final position and
+            // ends the run. Skipped during a finger drag for the same reason
+            // preloading is: the measurement drops frames mid-swipe, and the
+            // release settles through the debounce anyway (readest#4785).
+            if (this.scrolled && !this.#isAnimating && !this.#touchScrolled) {
+                const now = Date.now()
+                if (scrollBurstStart == null) scrollBurstStart = now
+                else if (now - scrollBurstStart >= SCROLL_RELOCATE_MAX_WAIT) {
+                    scrollBurstStart = now
+                    scrolledScrollRelocate()
                 }
             }
             debouncedScroll()
@@ -2071,6 +2143,31 @@ export class Paginator extends HTMLElement {
     }
     set containerPosition(newVal) {
         this.#container[this.scrollProp] = newVal
+    }
+    // Scroll offsets quantize to whole CSS pixels in both Blink and WebKit
+    // (`scrollTop = 100.5` reads back 100 or 101), so a slow continuous scroll
+    // such as Auto Scroll advances in visible one-pixel steps: at 5px/s that is
+    // one jump every 200ms. The whole pixels stay in the scroll position, which
+    // everything else reads; this carries only the sub-pixel remainder, as a
+    // composited transform on the scrollport itself.
+    //
+    // The transform goes on #container rather than its children on purpose: a
+    // transform on the children shifts their border boxes and shrinks the
+    // container's scrollable overflow, which desynchronizes the scroll math
+    // (readest#5663). Transforming the scrollport moves it as a whole and
+    // leaves its scrollable overflow untouched.
+    get subpixelOffset() {
+        return this.#subpixelOffset
+    }
+    set subpixelOffset(offset) {
+        const value = Number.isFinite(offset) ? offset : 0
+        if (value === this.#subpixelOffset) return
+        this.#subpixelOffset = value
+        // Scrolling forward by `value` moves the content back by the same
+        // amount. Vertical writing pages along the inline axis in scrolled mode.
+        const axis = this.scrollProp === 'scrollLeft' ? 'X' : 'Y'
+        this.#container.style.transform = value
+            ? `translate${axis}(${-value}px) translateZ(0)` : ''
     }
     get scrollLocked() {
         return this.#scrollLocked
@@ -3190,6 +3287,24 @@ export class Paginator extends HTMLElement {
             this.#getRectMapper(targetView))
         return range ? { range, index: this.#primaryIndex } : undefined
     }
+    // Whether the current Range anchor starts inside the visible range.
+    // Fraction and Element anchors are never considered visible, so they
+    // keep being replaced by the visible range as before.
+    #anchorIsVisible(range) {
+        const anchor = this.#anchor
+        if (!anchor?.startContainer) return false
+        const node = anchor.startContainer
+        // comparePoint throws for a node rooted outside the range's document,
+        // i.e. an anchor in another section or in a torn-down document.
+        if (!node.isConnected || node.ownerDocument !== range.startContainer.ownerDocument)
+            return false
+        try {
+            return range.comparePoint(node, anchor.startOffset) === 0
+        } catch {
+            // The anchored text node has been shortened since (IndexSizeError).
+            return false
+        }
+    }
     // Determine which view is primary based on scroll position
     #detectPrimaryView() {
         if (this.#views.size <= 1) return
@@ -3263,9 +3378,18 @@ export class Paginator extends HTMLElement {
         if (!range) return
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
-        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
+        if (reason === 'selection' || reason === 'navigation' || reason === 'anchor')
+            this.#justAnchored = true
+        // The scroll that re-anchoring itself performs (a resize re-render)
+        // lands here through the debounced container scroll listener. Taking
+        // the reflowed page's visible range as the new anchor then moves the
+        // anchor to that page's start, which precedes the old anchor whenever
+        // the two layouts' page boundaries differ, so the next resize back
+        // settles one page earlier every time (readest#5808). A container
+        // scroll that keeps the anchor on the page is not a navigation away
+        // from it: keep the anchor.
+        else if (reason !== 'container-scroll' || !this.#anchorIsVisible(range))
             this.#anchor = range
-        else this.#justAnchored = true
 
         const index = visibleIndex ?? this.#primaryIndex
         const primaryView = this.#primaryView
@@ -3750,7 +3874,7 @@ export class Paginator extends HTMLElement {
             } else $style.textContent = styles
 
             // needed because the resize observer doesn't work in Firefox
-            view.document?.fonts?.ready?.then(() => view.expand())
+            fontsReady(view.document).then(() => view.expand())
         }
 
         // NOTE: needs `requestAnimationFrame` in Chromium

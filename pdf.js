@@ -468,13 +468,14 @@ export const makePDF = async file => {
         queue.push([begin, end])
         pump()
     }
-    const pdf = await pdfjsLib.getDocument({
+    const loadingTask = pdfjsLib.getDocument({
         range: transport,
         wasmUrl: pdfjsPath(''),
         cMapUrl: pdfjsPath('cmaps/'),
         standardFontDataUrl: pdfjsPath('standard_fonts/'),
         isEvalSupported: false,
-    }).promise
+    })
+    const pdf = await loadingTask.promise
 
     // Get viewport dimensions from first page for fixed-layout rendering
     const firstPage = await pdf.getPage(1)
@@ -502,8 +503,27 @@ export const makePDF = async file => {
     const calibreSeries = parseCalibreSeriesFromXMP(metadata?.getRaw?.())
     if (calibreSeries) book.metadata.belongsTo = { series: calibreSeries }
 
+    // PDFs bound right-to-left (Japanese photo books, manga) declare it in the
+    // catalog's ViewerPreferences; surface it as book.dir so the fixed-layout
+    // renderer pairs and orders two-page spreads right-to-left.
+    const viewerPreferences = await pdf.getViewerPreferences().catch(() => null)
+    const direction = viewerPreferences?.get?.('Direction')
+        ?? viewerPreferences?.Direction
+    if (direction === 'R2L') book.dir = 'rtl'
+
     const outline = await pdf.getOutline()
     book.toc = outline ? await Promise.all(outline.map(item => makeTOCItem(item, pdf))) : null
+
+    // Page labels (PDF 32000-1 §12.4.2) are the numbers printed on the pages
+    // -- roman-numeral front matter, a body that restarts at 1 -- and are what
+    // the book's own TOC means by "page 139", as opposed to the physical index
+    // into the file. Expose them as the page list so they reach readers through
+    // the same `pageItem` channel as an EPUB page-list nav. Like PDF.js, ignore
+    // labels that merely restate the physical page numbers or are all empty.
+    const labels = await pdf.getPageLabels().catch(() => null)
+    book.pageList = labels?.some((label, i) => label && label !== String(i + 1))
+        ? labels.map((label, i) => ({ label, href: JSON.stringify(i), index: i }))
+        : null
 
     const cache = new Map()
     const pageCache = new Map()
@@ -591,8 +611,11 @@ export const makePDF = async file => {
         size: 1000,
     }))
     book.isExternal = uri => /^\w+:/i.test(uri)
+    // TOC hrefs are JSON-encoded destinations (named or explicit); page-list
+    // hrefs are JSON-encoded page indices.
     book.resolveHref = async href => {
         const parsed = JSON.parse(href)
+        if (typeof parsed === 'number') return { index: parsed }
         const dest = typeof parsed === 'string'
             ? await pdf.getDestination(parsed) : parsed
         const index = await pdf.getPageIndex(dest[0])
@@ -601,6 +624,7 @@ export const makePDF = async file => {
     book.splitTOCHref = async href => {
         if (!href) return [null, null]
         const parsed = JSON.parse(href)
+        if (typeof parsed === 'number') return [parsed, null]
         const dest = typeof parsed === 'string'
             ? await pdf.getDestination(parsed) : parsed
         try {
@@ -623,7 +647,7 @@ export const makePDF = async file => {
             page?.cleanup()
         }
         pageCache.clear()
-        pdf.destroy()
+        loadingTask.destroy()
     }
     return book
 }
