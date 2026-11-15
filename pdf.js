@@ -450,33 +450,93 @@ const parseCalibreSeriesFromXMP = raw => {
 // WebView's heap, crashing on 50 MB+ PDFs (readest #3470). Throttle here.
 const MAX_CONCURRENT_RANGES = 6
 
-export const makePDF = async file => {
+export const makePDF = async (file, { signal } = {}) => {
     const transport = new pdfjsLib.PDFDataRangeTransport(file.size, [])
-    // Bound the concurrent range reads instead of dispatching them all at once.
-    let active = 0
     const queue = []
+    const pending = new Set()
+    const cache = new Map()
+    const pageCache = new Map()
+    let stopped = false
+    let loadingTask
+    let destroying
+    let rejectFailure
+    const failure = new Promise((_, reject) => { rejectFailure = reject })
+    // PDF.js does not await requestDataRange; all queue failures need an observer.
+    failure.catch(() => {})
+    const check = () => {
+        if (stopped) throw new Error('PDF is closed')
+    }
+    const stop = reason => {
+        if (stopped) return
+        stopped = true
+        queue.length = 0
+        rejectFailure(reason)
+    }
+    const destroy = () => {
+        if (destroying) return destroying
+        stop(new Error('PDF is closed'))
+        signal?.removeEventListener('abort', abort)
+        destroying = (async () => {
+            // Start PDF.js cancellation immediately, then await real read settlement.
+            const results = await Promise.allSettled([
+                Promise.resolve().then(() => loadingTask?.destroy()),
+                ...pending,
+            ])
+            for (const entry of cache.values()) {
+                if (entry?.src) URL.revokeObjectURL(entry.src)
+            }
+            cache.clear()
+            for (const page of pageCache.values()) page?.cleanup()
+            pageCache.clear()
+            if (results[0].status === 'rejected') throw results[0].reason
+        })()
+        return destroying
+    }
+    const abort = () => {
+        stop(signal.reason ?? new Error('PDF loading cancelled'))
+        void destroy().catch(() => {})
+    }
     const pump = () => {
-        while (active < MAX_CONCURRENT_RANGES && queue.length) {
+        while (!stopped && pending.size < MAX_CONCURRENT_RANGES && queue.length) {
             const [begin, end] = queue.shift()
-            active++
-            file.slice(begin, end).arrayBuffer()
-                .then(chunk => transport.onDataRange(begin, chunk))
-                .finally(() => { active--; pump() })
+            const read = Promise.resolve().then(() => {
+                check()
+                return file.slice(begin, end).arrayBuffer()
+            }).then(chunk => {
+                if (!stopped) transport.onDataRange(begin, chunk)
+            })
+            pending.add(read)
+            void read.then(() => {
+                pending.delete(read)
+                pump()
+            }, error => {
+                pending.delete(read)
+                stop(error)
+                void destroy().catch(() => {})
+            })
         }
     }
     transport.requestDataRange = (begin, end) => {
+        if (stopped) return
         queue.push([begin, end])
         pump()
     }
-    const loadingTask = pdfjsLib.getDocument({
-        range: transport,
-        wasmUrl: pdfjsPath(''),
-        cMapUrl: pdfjsPath('cmaps/'),
-        standardFontDataUrl: pdfjsPath('standard_fonts/'),
-        isEvalSupported: false,
-    })
-    const pdf = await loadingTask.promise
-
+    transport.abort = () => {
+        stop(new Error('PDF transport aborted'))
+        void destroy().catch(() => {})
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    try {
+        if (signal?.aborted) throw signal.reason ?? new Error('PDF loading cancelled')
+        loadingTask = pdfjsLib.getDocument({
+            range: transport,
+            wasmUrl: pdfjsPath(''),
+            cMapUrl: pdfjsPath('cmaps/'),
+            standardFontDataUrl: pdfjsPath('standard_fonts/'),
+            isEvalSupported: false,
+        })
+        const pdf = await Promise.race([loadingTask.promise, failure])
+        return await Promise.race([(async () => {
     // Get viewport dimensions from first page for fixed-layout rendering
     const firstPage = await pdf.getPage(1)
     const firstViewport = firstPage.getViewport({ scale: 1 })
@@ -525,9 +585,8 @@ export const makePDF = async file => {
         ? labels.map((label, i) => ({ label, href: JSON.stringify(i), index: i }))
         : null
 
-    const cache = new Map()
-    const pageCache = new Map()
     const getPage = async (i) => {
+        check()
         const cached = pageCache.get(i)
         if (cached) {
             // Move to end for LRU ordering
@@ -536,6 +595,7 @@ export const makePDF = async file => {
             return cached
         }
         const page = await pdf.getPage(i + 1)
+        check()
         pageCache.set(i, page)
 
         // Evict oldest pages when over limit, freeing internal page data
@@ -551,6 +611,7 @@ export const makePDF = async file => {
     book.sections = Array.from({ length: pdf.numPages }).map((_, i) => ({
         id: i,
         load: async () => {
+            check()
             const cached = cache.get(i)
             if (cached) {
                 // Move to end for LRU ordering
@@ -559,6 +620,10 @@ export const makePDF = async file => {
                 return cached
             }
             const url = await renderPage(await getPage(i))
+            if (stopped) {
+                URL.revokeObjectURL(url.src)
+                check()
+            }
             cache.set(i, url)
 
             // Evict oldest render results when over limit
@@ -637,17 +702,15 @@ export const makePDF = async file => {
     }
     book.getTOCFragment = doc => doc.documentElement
     book.getCover = async () => renderPage(await pdf.getPage(1), true)
-    book.destroy = () => {
-        // Clean up all cached canvases and revoke blob URLs
-        for (const [, entry] of cache) {
-            if (entry?.src) URL.revokeObjectURL(entry.src)
-        }
-        cache.clear()
-        for (const [, page] of pageCache) {
-            page?.cleanup()
-        }
-        pageCache.clear()
-        loadingTask.destroy()
-    }
+    book.destroy = destroy
     return book
+        })(), failure])
+    } catch (error) {
+        try {
+            await destroy()
+        } catch (cleanupError) {
+            throw new AggregateError([error, cleanupError], 'PDF initialization and cleanup failed')
+        }
+        throw error
+    }
 }
